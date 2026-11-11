@@ -222,6 +222,64 @@ After applying the steps in the hardening guide (see below), the output changes 
 Below is a screen shot of the client-auditing output when an unhardened OpenSSH v7.2 client connects:
 ![client_screenshot](https://user-images.githubusercontent.com/2982011/68867998-b946c100-06c4-11ea-975f-1f47e4178a74.png)
 
+## Evidence Classification (JSON)
+
+Not every line in a scan result is equally conclusive, so the JSON output now
+includes a machine-readable `evidence` section that records *how* each claim
+was established.  This addresses integrations that previously treated
+version-matching hints as confirmed vulnerabilities.
+
+Three stable evidence types are used:
+
+| Type | Meaning |
+| --- | --- |
+| `negotiation_observation` | Directly observed in the peer's key exchange (KEXINIT) message.  An advertised weak algorithm is an observed fact. |
+| `banner_inference` | Inferred by parsing the self-asserted, free-form SSH banner (product/version).  Not independently verified. |
+| `undetermined` | The data needed to decide (for example, a parseable software fingerprint) was not available. |
+
+The section has two parts:
+
+ - `evidence.fingerprint` preserves the **raw** banner software string and
+   comments together with the parsed `vendor`/`product`/`version`/`patch`/`os`
+   values.  Its `inference.status` is `banner_inference` when parsing
+   succeeded and `undetermined` otherwise, and `inference.reasons` explains
+   the caveats: distribution/OS repackaging, vendor re-branding, a missing
+   numeric version, or a non-upstream patch suffix whose upstream fixes may
+   have been back-ported.  A portable OpenSSH `pN` suffix is upstream naming
+   and is *not* treated as a back-port signal.
+ - `evidence.findings` contains one entry per negotiated algorithm.  Every
+   entry is a `negotiation_observation` (the algorithm really was offered),
+   with its `fail`/`warn`/`info` notes taken solely from the bundled algorithm
+   database.  Banner uncertainty never downgrades these: an observed weak
+   algorithm stays reported even when the banner is unreliable.  No new
+   vulnerability conclusions are invented.
+
+The text report renders the same structure in an `# evidence` section, so the
+text and JSON outputs cannot contradict each other.
+
+### Migration Notes for Integrators
+
+The change is additive; all legacy fields keep their previous meaning and
+location.  However, integrators that derive vulnerability tickets from the
+output should update their interpretation:
+
+ - The per-algorithm `notes.fail` / `notes.warn` arrays (in the legacy `kex`,
+   `key`, `enc`, and `mac` lists) describe properties of algorithms **observed
+   in the negotiation**, not vulnerabilities proven from a version number.
+   Do not file a "vulnerable version" ticket from these alone; cross-check the
+   matching `evidence.findings[].type`, which is always
+   `negotiation_observation`.
+ - The top-level `cves` array is always empty and must not be used as
+   evidence.  Version-based CVE matching was removed in v3.3.0 because banner
+   version strings are unreliable (back-ports, re-brandings, suffixes).
+ - `banner.software` and the `(gen) software` line are self-asserted
+   fingerprints.  Treat them as `banner_inference`, never as confirmation that
+   a specific upstream version—and therefore a specific CVE—applies.
+ - For an authoritative machine-readable signal, consume `evidence` instead:
+   rely on `negotiation_observation` findings for confirmed weak-algorithm
+   problems, and treat `banner_inference` / `undetermined` fingerprint status
+   as inconclusive for version-based claims.
+
 ## Hardening Guides
 Guides to harden server & client configuration are built into the tool (see `--list-hardening-guides` and `--get-hardening-guide` options).  Additionally, they are also available online at: [https://www.ssh-audit.com/hardening_guides.html](https://www.ssh-audit.com/hardening_guides.html)
 
@@ -254,6 +312,7 @@ For convenience, a web front-end on top of the command-line tool is available at
 ## ChangeLog
 
 ### v3.9.1-dev
+ - Added a machine-readable `evidence` section to JSON output (and an `# evidence` section to text output) that distinguishes direct key-exchange `negotiation_observation` findings from `banner_inference` fingerprint parsing and `undetermined` cases, so version-matching hints are no longer mistaken for confirmed vulnerabilities.  The raw software fingerprint and its parsed components are preserved, including distribution suffixes, vendor re-brandings, missing versions, and back-ported version strings.  Observed weak-algorithm findings are never downgraded; no new vulnerability conclusions are added.  See the "Evidence Classification (JSON)" section for migration guidance.
  - Added support for Python 3.15.
  - Fixed a perhaps rare crash when performing connection rate tests during standard audits.
  - No longer mark `kexguess2@matt.ucc.asn.au` (pseudo-kex used by Dropbear) as not PQ-safe.

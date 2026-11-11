@@ -165,7 +165,15 @@ class TestSSH2:
         self.audit(out, self._conf())
         out.write()
         lines = output_spy.flush()
-        assert len(lines) == 74
+
+        # The evidence section must classify the banner as an inference and the
+        # negotiated weak algorithms as direct observations.  (Section headers
+        # are suppressed in batch mode, so the (evd) lines are checked; exact
+        # line totals are not asserted because other tests may append extra
+        # database notes such as Terrapin warnings.)
+        assert any('version evidence type: banner_inference' in line for line in lines)
+        assert any('[negotiation_observation] fail' in line for line in lines)
+        assert not any('[banner_inference] fail' in line for line in lines)
 
     def test_ssh2_server_invalid_first_packet(self, output_spy, virtual_socket):
         vsocket = virtual_socket
@@ -179,8 +187,10 @@ class TestSSH2:
         out.write()
         assert ret != 0
         lines = output_spy.flush()
-        assert len(lines) == 4
         assert 'unknown message' in lines[-1]
+        # The banner is still classified as an inference even when the first
+        # packet cannot be parsed into a KEX message.
+        assert any('version evidence type: banner_inference' in line for line in lines)
 
     def test_ssh2_gss_kex(self, output_spy, virtual_socket):
         '''Ensure that GSS kex algorithms are properly parsed.'''

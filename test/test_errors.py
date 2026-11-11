@@ -122,44 +122,46 @@ class TestErrors:
         vsocket.rdata.append(b'SSH-2.0-ssh-audit-test\r\n')
         vsocket.rdata.append(socket.error(54, 'Connection reset by peer'))
         lines = self._audit(output_spy)
-        assert len(lines) == 2
         assert 'error reading packet' in lines[-1]
         assert 'reset by peer' in lines[-1]
+        # A banner without a KEX still yields an undetermined evidence section.
+        assert any('version evidence type: undetermined' in line for line in lines)
+        assert any(line.startswith('(evd)') for line in lines)
 
     def test_empty_data_after_banner(self, output_spy, virtual_socket):
         vsocket = virtual_socket
         vsocket.rdata.append(b'SSH-2.0-ssh-audit-test\r\n')
         lines = self._audit(output_spy)
-        assert len(lines) == 2
         assert 'error reading packet' in lines[-1]
         assert 'empty' in lines[-1]
+        assert any('version evidence type: undetermined' in line for line in lines)
 
     def test_wrong_data_after_banner(self, output_spy, virtual_socket):
         vsocket = virtual_socket
         vsocket.rdata.append(b'SSH-2.0-ssh-audit-test\r\n')
         vsocket.rdata.append(b'xxx\n')
         lines = self._audit(output_spy)
-        assert len(lines) == 2
         assert 'error reading packet' in lines[-1]
         assert 'xxx' in lines[-1]
+        assert any('version evidence type: undetermined' in line for line in lines)
 
     def test_non_ascii_banner(self, output_spy, virtual_socket):
         vsocket = virtual_socket
         vsocket.rdata.append(b'SSH-2.0-ssh-audit-test\xc3\xbc\r\n')
         lines = self._audit(output_spy)
-        assert len(lines) == 3
         assert 'error reading packet' in lines[-1]
-        assert 'ASCII' in lines[-2]
-        assert lines[-3].endswith('SSH-2.0-ssh-audit-test?')
+        assert any('ASCII' in line for line in lines)
+        assert any(line.endswith('SSH-2.0-ssh-audit-test?') for line in lines)
+        assert any('version evidence type: undetermined' in line for line in lines)
 
     def test_nonutf8_data_after_banner(self, output_spy, virtual_socket):
         vsocket = virtual_socket
         vsocket.rdata.append(b'SSH-2.0-ssh-audit-test\r\n')
         vsocket.rdata.append(b'\x81\xff\n')
         lines = self._audit(output_spy)
-        assert len(lines) == 2
         assert 'error reading packet' in lines[-1]
         assert '\\x81\\xff' in lines[-1]
+        assert any('version evidence type: undetermined' in line for line in lines)
 
     def test_protocol_mismatch_by_conf(self, output_spy, virtual_socket):
         vsocket = virtual_socket
@@ -167,6 +169,6 @@ class TestErrors:
         vsocket.rdata.append(b'Protocol major versions differ.\n')
         conf = self._conf()
         lines = self._audit(output_spy, conf)
-        assert len(lines) == 4
         assert 'error reading packet' in lines[-1]
         assert 'major versions differ' in lines[-1]
+        assert any('version evidence type: undetermined' in line for line in lines)

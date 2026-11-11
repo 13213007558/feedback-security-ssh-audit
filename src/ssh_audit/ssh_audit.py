@@ -48,6 +48,8 @@ from ssh_audit.auditconf import AuditConf
 from ssh_audit.banner import Banner
 from ssh_audit.dheat import DHEat
 from ssh_audit import exitcodes
+from ssh_audit.evidence import build_evidence
+from ssh_audit.evidence import render_text_evidence
 from ssh_audit.fingerprint import Fingerprint
 from ssh_audit.gextest import GEXTest
 from ssh_audit.hostkeytest import HostKeyTest
@@ -226,6 +228,30 @@ def output_security(out: OutputBuffer, banner: Optional[Banner], padlen: int, is
 
     if not out.is_section_empty() and not is_json_output:
         out.head('# security')
+        out.flush_section()
+        out.sep()
+
+
+def output_evidence(out: OutputBuffer, banner: Optional[Banner],
+                    software: Optional[Software], kex: Optional[SSH2_Kex],
+                    is_json_output: bool) -> None:
+    '''Renders the evidence-classification section for text output.
+
+    This never changes the fail/warn/info ratings computed elsewhere; it only
+    explains whether each kind of claim is a banner inference or a direct
+    negotiation observation.
+    '''
+    with out:
+        if banner is None and kex is None:
+            return
+        alg_db = SSH2_KexDB.get_db()
+        evidence = build_evidence(banner, software, kex, alg_db)
+        for line in render_text_evidence(evidence):
+            # Evidence lines are informational metadata, not new findings.
+            out.info(line)
+
+    if not out.is_section_empty() and not is_json_output:
+        out.head('# evidence')
         out.flush_section()
         out.sep()
 
@@ -576,6 +602,9 @@ def output(out: OutputBuffer, aconf: AuditConf, banner: Optional[Banner], header
         title, atype = 'message authentication code algorithms', 'mac'
         program_retval = output_algorithms(out, title, adb, atype, kex.server.mac, unknown_algorithms, aconf.json, program_retval, maxlen)
 
+    # Explain the evidentiary basis (banner inference vs. negotiation
+    # observation) without altering any fail/warn/info ratings above.
+    output_evidence(out, banner, software, kex, aconf.json)
     output_fingerprints(out, algs, aconf.json)
     perfect_config = output_recommendations(out, algs, algorithm_recommendation_suppress_list, software, aconf.json, maxlen)
     output_info(out, software, client_audit, not perfect_config, aconf.json, additional_notes)
@@ -1141,6 +1170,14 @@ def build_struct(target_host: str, banner: Optional['Banner'], kex: Optional['SS
 
     # Historically, CVE information was returned.  Now we'll just return an empty dictionary so as to not break any legacy clients.
     res['cves'] = []
+
+    # Machine-readable evidence classification.  This distinguishes direct key
+    # exchange observations from banner-based inferences and undetermined
+    # claims, without adding any conclusion not already present in the bundled
+    # database.  The legacy notes/cves fields above are unchanged for backward
+    # compatibility, but should no longer be treated as version-proven
+    # vulnerability evidence (see the migration notes in README.md).
+    res['evidence'] = build_evidence(banner, software, kex, SSH2_KexDB.get_db())
 
     # Add in the recommendations.
     res['recommendations'] = get_algorithm_recommendations(algorithms, algorithm_recommendation_suppress_list, software, for_server=True)
