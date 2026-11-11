@@ -41,6 +41,14 @@ class Policy:
 
     WARNING_DEPRECATED_DIRECTIVES = "\nWARNING: this policy is using deprecated features.  Future versions of ssh-audit may remove support for them.  Re-generating the policy file is perhaps the most straight-forward way of resolving this issue.  Manually converting the 'hostkey_size_*', 'cakey_size_*', and 'dh_modulus_size_*' directives into the new format is another option.\n"
 
+    # Pseudo key-exchange algorithms that carry security-critical negotiation state.  These can never be treated as ordinary algorithms: when a policy requires them, the target must advertise the exact same marker, even if algorithm subsets and re-orderings are allowed.  Each marker is bound to one negotiation direction (client-to-server vs. server-to-client).
+    REQUIRED_KEX_MARKERS = {
+        'kex-strict-c-v00@openssh.com': 'client-to-server',  # Strict KEX countermeasure (Terrapin / CVE-2023-48795), client side.
+        'kex-strict-s-v00@openssh.com': 'server-to-client',  # Strict KEX countermeasure (Terrapin / CVE-2023-48795), server side.
+        'ext-info-c': 'client-to-server',  # Extension negotiation (RFC 8308), client side.
+        'ext-info-s': 'server-to-client',  # Extension negotiation (RFC 8308), server side.
+    }
+
     def __init__(self, policy_file: Optional[str] = None, policy_data: Optional[str] = None, manual_load: bool = False, json_output: bool = False) -> None:
         self._name: Optional[str] = None
         self._version: Optional[str] = None
@@ -226,12 +234,15 @@ class Policy:
         self._name_and_version = "%s (version %s)" % (self._name, self._version)
 
 
-    def _append_error(self, mismatched_field: str, expected_required: Optional[List[str]], expected_optional: Optional[List[str]], actual: List[str]) -> None:
+    def _append_error(self, mismatched_field: str, expected_required: Optional[List[str]], expected_optional: Optional[List[str]], actual: List[str], reason: Optional[str] = None) -> None:
         if expected_required is None:
             expected_required = ['']
         if expected_optional is None:
             expected_optional = ['']
-        self._errors.append({'mismatched_field': mismatched_field, 'expected_required': expected_required, 'expected_optional': expected_optional, 'actual': actual})
+        error: Dict[str, Any] = {'mismatched_field': mismatched_field, 'expected_required': expected_required, 'expected_optional': expected_optional, 'actual': actual}
+        if reason is not None:
+            error['reason'] = reason
+        self._errors.append(error)
 
 
     def _normalize_hostkey_sizes(self) -> None:
@@ -338,6 +349,42 @@ macs = %s
         return policy_data
 
 
+    def _check_required_kex_markers(self, actual_kex_algorithms: List[str]) -> bool:
+        '''Ensures that every security-critical negotiation marker required by this policy is advertised by the target.
+
+        Strict-KEX (Terrapin countermeasure) and ext-info (RFC 8308 extension negotiation) markers encode security state rather than negotiable algorithms, so a target that drops one is not merely implementing a "stricter subset": it is missing a required security condition.  Markers are direction-specific, hence each failure records the marker and its negotiation direction.
+        '''
+
+        ret = True
+        for marker, direction in Policy.REQUIRED_KEX_MARKERS.items():
+            if marker in self._kex and marker not in actual_kex_algorithms:
+                ret = False
+                self._append_error('Key exchanges (%s)' % direction, self._kex, None, actual_kex_algorithms,
+                                   'required security marker %s is missing from the %s key exchange list' % (marker, direction))
+        return ret
+
+
+    def _check_directional_algorithms(self, field_name: str, expected: List[str], actual: List[str], direction: str) -> bool:
+        '''Compares one direction (client-to-server or server-to-client) of a cipher or MAC list against the policy.
+
+        Ordinary algorithms may be a subset or re-ordered when allowed, but each negotiation direction is checked independently so that a weakened list in one direction cannot be hidden by a compliant list in the other.
+        '''
+
+        mismatched_field = '%s (%s)' % (field_name, direction)
+        if self._allow_algorithm_subset_and_reordering:
+            for algorithm in actual:
+                if algorithm not in expected:
+                    self._append_error(mismatched_field, expected, None, actual,
+                                       'algorithm %s is not allowed in the %s list' % (algorithm, direction))
+                    return False
+            return True
+
+        if actual != expected:
+            self._append_error(mismatched_field, expected, None, actual)
+            return False
+        return True
+
+
     def evaluate(self, banner: Optional['Banner'], kex: Optional['SSH2_Kex']) -> Tuple[bool, List[Dict[str, str]], str]:
         '''Evaluates a server configuration against this policy.  Returns a tuple of a boolean (True if server adheres to policy) and an array of strings that holds error messages.'''
 
@@ -353,9 +400,11 @@ macs = %s
             error_list, error_str = self._get_errors()
             return ret, error_list, error_str
 
-        if (self._compressions is not None) and (kex.server.compression != self._compressions):
-            ret = False
-            self._append_error('Compression', self._compressions, None, kex.server.compression)
+        if (self._compressions is not None):
+            if not self._check_directional_algorithms('Compression', self._compressions, kex.client.compression, 'client-to-server'):
+                ret = False
+            if not self._check_directional_algorithms('Compression', self._compressions, kex.server.compression, 'server-to-client'):
+                ret = False
 
         # If a list of optional host keys was given in the policy, remove any of its entries from the list retrieved from the server.  This allows us to do an exact comparison with the expected list below.
         pruned_host_keys = kex.key_algorithms
@@ -409,51 +458,36 @@ macs = %s
 
         # Check key exchanges.
         if self._kex is not None:
-            # If the policy allows subsets and re-ordered algorithms...
+            # Security-critical markers (kex-strict-*-v00@openssh.com and ext-info-*) are mandatory conditions, not negotiable algorithms: they must be present even when subsets and re-orderings are allowed.
+            if not self._check_required_kex_markers(kex.kex_algorithms):
+                ret = False
+
+            # If the policy allows subsets and re-ordered algorithms, ensure every ordinary algorithm advertised by the target is allowed by the policy.
             if self._allow_algorithm_subset_and_reordering:
                 for kex_t in kex.kex_algorithms:
                     if kex_t not in self._kex:
                         ret = False
                         self._append_error('Key exchanges', self._kex, None, kex.kex_algorithms)
                         break
-                # If kex-strict-?-v00@openssh.com is in the policy (i.e. the Terrapin vulnerability countermeasure), then it must appear in the server's list, regardless of the "allow_algorithm_subset_and_reordering" flag.
-                if ('kex-strict-s-v00@openssh.com' in self._kex and 'kex-strict-s-v00@openssh.com' not in kex.kex_algorithms) or \
-                   ('kex-strict-c-v00@openssh.com' in self._kex and 'kex-strict-c-v00@openssh.com' not in kex.kex_algorithms):
-                    ret = False
-                    self._append_error('Key exchanges', self._kex, None, kex.kex_algorithms)
 
             # The policy requires exact matching of algorithms.
             elif kex.kex_algorithms != self._kex:
                 ret = False
                 self._append_error('Key exchanges', self._kex, None, kex.kex_algorithms)
 
-        # Checking Ciphers
+        # Checking Ciphers.  Each negotiation direction is checked independently: in a client policy these are the client's client-to-server / server-to-client lists, while in a server policy they are the server's.  AEAD ciphers (e.g. chacha20-poly1305, aes*-gcm) authenticate implicitly, so their MAC lists are separate data and are validated by the MAC checks below.
         if self._ciphers is not None:
-            # If the policy allows subsets and re-ordered algorithms...
-            if self._allow_algorithm_subset_and_reordering:
-                for cipher_t in kex.server.encryption:
-                    if cipher_t not in self._ciphers:
-                        ret = False
-                        self._append_error('Ciphers', self._ciphers, None, kex.server.encryption)
-                        break
-            # The policy requires exact matching of algorithms.
-            elif kex.server.encryption != self._ciphers:
+            if not self._check_directional_algorithms('Ciphers', self._ciphers, kex.client.encryption, 'client-to-server'):
                 ret = False
-                self._append_error('Ciphers', self._ciphers, None, kex.server.encryption)
+            if not self._check_directional_algorithms('Ciphers', self._ciphers, kex.server.encryption, 'server-to-client'):
+                ret = False
 
-        # Checking MACs
+        # Checking MACs.  Both directions are checked independently, since separate MAC algorithms only apply to non-AEAD ciphers and each direction may negotiate them differently.
         if self._macs is not None:
-            # If the policy allows subsets and re-ordered algorithms...
-            if self._allow_algorithm_subset_and_reordering:
-                for mac_t in kex.server.mac:
-                    if mac_t not in self._macs:
-                        ret = False
-                        self._append_error('MACs', self._macs, None, kex.server.mac)
-                        break
-            # The policy requires exact matching of algorithms.
-            elif kex.server.mac != self._macs:
+            if not self._check_directional_algorithms('MACs', self._macs, kex.client.mac, 'client-to-server'):
                 ret = False
-                self._append_error('MACs', self._macs, None, kex.server.mac)
+            if not self._check_directional_algorithms('MACs', self._macs, kex.server.mac, 'server-to-client'):
+                ret = False
 
         if self._dh_modulus_sizes is not None:
             dh_modulus_types = list(self._dh_modulus_sizes.keys())
@@ -483,8 +517,13 @@ macs = %s
         spacer = ''
         for e in self._errors:
 
-            subset_and_reordering_semicolon = hostkey_subset_and_reordering_semicolon if e["mismatched_field"] == "Host keys" else all_subset_and_reordering_semicolon
-            subset_and_reordering_parens = hostkey_subset_and_reordering_parens if e["mismatched_field"] == "Host keys" else all_subset_and_reordering_parens
+            # Host key mismatches carry their own subset flag; every other field uses the algorithm subset flag, including direction-suffixed fields (e.g. "Ciphers (client-to-server)").
+            if e["mismatched_field"] == "Host keys":
+                subset_and_reordering_semicolon = hostkey_subset_and_reordering_semicolon
+                subset_and_reordering_parens = hostkey_subset_and_reordering_parens
+            else:
+                subset_and_reordering_semicolon = all_subset_and_reordering_semicolon
+                subset_and_reordering_parens = all_subset_and_reordering_parens
 
             e_str = "  * %s did not match.\n" % e['mismatched_field']
 
@@ -495,6 +534,8 @@ macs = %s
                 e_str += "    - Expected%s: %s\n" % (subset_and_reordering_parens, Policy._normalize_error_field(e['expected_required']))
                 spacer = '   '
             e_str += "    - Actual:%s%s\n" % (spacer, Policy._normalize_error_field(e['actual']))
+            if 'reason' in e:
+                e_str += "    - Reason:  %s\n" % e['reason']
             error_list.append(e_str)
 
         error_list.sort()  # To ensure repeatable results for testing.
