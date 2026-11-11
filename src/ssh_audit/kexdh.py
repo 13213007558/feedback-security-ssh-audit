@@ -41,6 +41,45 @@ class KexDHException(Exception):
     pass
 
 
+# Base class for all failures that can occur during a DH group exchange
+# (RFC 4419).  Every variant is still a KexDHException, so existing call
+# sites that only need the broad category keep working.
+class KexGroupExchangeException(KexDHException):
+    pass
+
+
+# The peer explicitly rejected our GEX request (i.e.: it sent a
+# SSH_MSG_DISCONNECT or another terminal message instead of a
+# SSH_MSG_KEX_DH_GEX_GROUP).  This is evidence of a refusal for the
+# requested min/pref/max range, not evidence that only safe moduli are
+# supported.
+class KexGroupExchangeRejectException(KexGroupExchangeException):
+    pass
+
+
+# The connection was torn down (reset, EOF, timeout) before a GEX group
+# could be obtained.  The probe could not be completed.
+class KexGroupExchangeIncompleteException(KexGroupExchangeException):
+    pass
+
+
+# The GEX group message could not be parsed into a valid prime/generator
+# pair (truncated payload, zero-length or non-positive modulus, etc.).
+class KexGroupExchangeEncodingException(KexGroupExchangeException):
+    pass
+
+
+# A GEX group was returned, but its modulus falls outside the
+# min/max range the client requested.  The first argument is the actual
+# modulus size (in bits) observed on the wire.
+class KexGroupExchangeRangeException(KexGroupExchangeException):
+    def __init__(self, observed_bits: int, min_bits: int, max_bits: int) -> None:
+        super().__init__('GEX modulus of %d bits is outside requested range of %d-%d bits.' % (observed_bits, min_bits, max_bits))
+        self.observed_bits = observed_bits
+        self.min_bits = min_bits
+        self.max_bits = max_bits
+
+
 class KexDH:  # pragma: nocover
     def __init__(self, out: 'OutputBuffer', kex_name: str, hash_alg: str, g: int, p: int) -> None:
         self.out = out
@@ -381,18 +420,41 @@ class KexGroupExchange(KexDH):
         s.send_packet()
 
         packet_type, payload = s.read_packet()
-        if packet_type not in [Protocol.MSG_KEXDH_GEX_GROUP, Protocol.MSG_DEBUG]:
-            raise KexDHException('Expected MSG_KEXDH_GEX_REPLY (%d), but got %d instead.' % (Protocol.MSG_KEXDH_GEX_REPLY, packet_type))
+
+        # A packet type of -1 means the connection failed (reset, EOF, or
+        # timeout) before any reply arrived.  The probe could not be
+        # completed, so we must not treat this as the server refusing weak
+        # moduli.
+        if packet_type == -1:
+            raise KexGroupExchangeIncompleteException('connection was interrupted before a GEX group was received.')
 
         # Skip any & all MSG_DEBUG messages.
         while packet_type == Protocol.MSG_DEBUG:
             packet_type, payload = s.read_packet()
+            if packet_type == -1:
+                raise KexGroupExchangeIncompleteException('connection was interrupted while skipping MSG_DEBUG messages during GEX.')
+
+        # An explicit SSH_MSG_DISCONNECT means the peer deliberately refused
+        # this request.  Any other (non-group) message likewise means the
+        # exchange was refused rather than answered.
+        if packet_type == Protocol.MSG_DISCONNECT:
+            raise KexGroupExchangeRejectException('peer explicitly rejected the GEX request (min=%d, pref=%d, max=%d) with SSH_MSG_DISCONNECT.' % (minbits, prefbits, maxbits))
+        if packet_type != Protocol.MSG_KEXDH_GEX_GROUP:
+            raise KexGroupExchangeRejectException('expected MSG_KEXDH_GEX_GROUP (%d), but got %d instead.' % (Protocol.MSG_KEXDH_GEX_GROUP, packet_type))
 
         try:
             # Parse the modulus (p) and generator (g) values from the server.
             ptr = 0
+            if len(payload) < 4:
+                raise KexGroupExchangeEncodingException('truncated GEX group message: missing modulus length field.')
+
             p_len = struct.unpack('>I', payload[ptr:ptr + 4])[0]
             ptr += 4
+
+            # A zero-length, truncated, or oversized modulus is an illegal
+            # encoding, not a valid group.
+            if p_len == 0 or p_len > len(payload) - ptr - 4:
+                raise KexGroupExchangeEncodingException('illegal GEX modulus encoding: length field (%d) does not match the %d payload bytes available.' % (p_len, len(payload) - ptr))
 
             p = int(binascii.hexlify(payload[ptr:ptr + p_len]), 16)
             ptr += p_len
@@ -400,14 +462,32 @@ class KexGroupExchange(KexDH):
             g_len = struct.unpack('>I', payload[ptr:ptr + 4])[0]
             ptr += 4
 
+            if g_len == 0 or g_len > len(payload) - ptr:
+                raise KexGroupExchangeEncodingException('illegal GEX generator encoding: length field (%d) does not match the %d payload bytes available.' % (g_len, len(payload) - ptr))
+
             g = int(binascii.hexlify(payload[ptr:ptr + g_len]), 16)
-            ptr += g_len
+            if p <= 1 or g <= 0:
+                raise KexGroupExchangeEncodingException('illegal GEX group: modulus and generator must be positive integers (p=%d, g=%d).' % (p, g))
+        except KexGroupExchangeEncodingException:
+            raise
         except struct.error:
-            raise KexDHException("Error while parsing modulus and generator during GEX init: %s" % str(traceback.format_exc())) from None
+            raise KexGroupExchangeEncodingException("error while parsing modulus and generator during GEX init: %s" % str(traceback.format_exc())) from None
+
+        # Record the group parameters before validating the negotiated size,
+        # so callers can still measure the actual modulus even when it
+        # violates the requested range.
+        super(KexGroupExchange, self).set_params(g, p)
+        modulus_bits = self.get_dh_modulus_size()
+
+        # RFC 4419 requires the server to honor the requested min/max
+        # bounds.  A modulus outside that range is a protocol violation and
+        # must be reported as anomalous evidence instead of being silently
+        # accepted (or silently dropped).
+        if modulus_bits < minbits or modulus_bits > maxbits:
+            raise KexGroupExchangeRangeException(modulus_bits, minbits, maxbits)
 
         # Now that we got the generator and modulus, perform the DH exchange
         # like usual.
-        super(KexGroupExchange, self).set_params(g, p)
         super(KexGroupExchange, self).send_init(s, Protocol.MSG_KEXDH_GEX_INIT)
 
 

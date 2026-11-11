@@ -466,6 +466,12 @@ macs = %s
                        (not self._allow_larger_keys and actual_dh_modulus_size != expected_dh_modulus_size):
                         ret = False
                         self._append_error('Group exchange (%s) modulus sizes' % dh_modulus_type, [str(expected_dh_modulus_size)], None, [str(actual_dh_modulus_size)])
+                elif dh_modulus_type in kex.gex_inconclusive():
+                    # The modulus size could not be determined because every
+                    # probe was refused or interrupted.  Missing evidence is
+                    # not a pass: report the requirement as unverified.
+                    ret = False
+                    self._append_error('Group exchange (%s) modulus sizes' % dh_modulus_type, [str(expected_dh_modulus_size)], None, ['unverified: %s' % kex.gex_inconclusive()[dh_modulus_type]])
 
         error_list, error_str = self._get_errors()
         return ret, error_list, error_str

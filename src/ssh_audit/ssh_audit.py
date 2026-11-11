@@ -1063,6 +1063,16 @@ def build_struct(target_host: str, banner: Optional['Banner'], kex: Optional['SS
                 hostkey_size = dh_alg_sizes[algorithm]
                 entry['keysize'] = hostkey_size
             res['kex'].append(entry)
+
+        # Detailed DH group-exchange evidence.  This is kept separate from
+        # the per-algorithm 'keysize' field so existing consumers are
+        # unaffected, while callers can distinguish an observed weak group
+        # from an inconclusive probe.
+        gex_evidence = GEXTest.evidence_struct()
+        if gex_evidence:
+            res['dh-gex'] = gex_evidence
+        if kex.gex_inconclusive():
+            res['dh-gex-inconclusive'] = kex.gex_inconclusive()
         res['key'] = []
         host_keys = kex.host_keys()
         for algorithm in kex.key_algorithms:
@@ -1389,7 +1399,21 @@ def run_gex_granular_modulus_size_test(out: OutputBuffer, s: 'SSH_Socket', kex: 
 
     permitted_syntax = get_permitted_syntax_for_gex_test()
 
+    # Start from a clean evidence set so repeated granular invocations within
+    # one process cannot carry over attempts from an earlier target.
+    GEXTest.reset_evidence()
+
     mod_dict: Dict[str, List[int]] = {}
+
+    # The worst result seen across all requested sizes is returned.  A weak
+    # modulus that was actually observed is a failure; a refused or
+    # interrupted probe is only a warning, since it proves nothing about the
+    # sizes the peer supports.
+    program_retval = exitcodes.GOOD
+
+    def _run_granular_set(i_bits: int, pref_bits: int, max_bits: int) -> None:
+        nonlocal program_retval
+        program_retval = max(program_retval, GEXTest.granular_modulus_size_test(out, s, kex, i_bits, pref_bits, max_bits, mod_dict))
 
     # Range syntax.
     if re.search(permitted_syntax['RANGE'], aconf.gex_test):
@@ -1411,31 +1435,25 @@ def run_gex_granular_modulus_size_test(out: OutputBuffer, s: 'SSH_Socket', kex: 
         out.v("A separate test will be performed against each of the following modulus sizes: " + ", ".join([str(x) for x in bits_in_range_to_test]) + ".", write_now=True)
 
         for i_bits in bits_in_range_to_test:
-            program_retval = GEXTest.granular_modulus_size_test(out, s, kex, i_bits, i_bits, i_bits, mod_dict)
-            if program_retval != exitcodes.GOOD:
-                return program_retval
+            _run_granular_set(i_bits, i_bits, i_bits)
 
     # Two variations of list syntax.
     if re.search(permitted_syntax['LIST_WITHOUT_MIN_PREF_MAX'], aconf.gex_test):
         bits_in_list_to_test = aconf.gex_test.split(',')
         out.v("A separate test will be performed against each of the following modulus sizes: " + ", ".join([str(x) for x in bits_in_list_to_test]) + ".", write_now=True)
         for s_bits in bits_in_list_to_test:
-            program_retval = GEXTest.granular_modulus_size_test(out, s, kex, int(s_bits), int(s_bits), int(s_bits), mod_dict)
-            if program_retval != exitcodes.GOOD:
-                return program_retval
+            _run_granular_set(int(s_bits), int(s_bits), int(s_bits))
 
     if re.search(permitted_syntax['LIST_WITH_MIN_PREF_MAX'], aconf.gex_test):
         sets_of_min_pref_max = aconf.gex_test.split(',')
         out.v("A separate test will be performed against each of the following sets of 'min:pref:max' modulus sizes: " + ', '.join(sets_of_min_pref_max), write_now=True)
         for set_of_min_pref_max in sets_of_min_pref_max:
             bits_in_list_to_test = set_of_min_pref_max.split(':')
-            program_retval = GEXTest.granular_modulus_size_test(out, s, kex, int(bits_in_list_to_test[0]), int(bits_in_list_to_test[1]), int(bits_in_list_to_test[2]), mod_dict)
-            if program_retval != exitcodes.GOOD:
-                return program_retval
+            _run_granular_set(int(bits_in_list_to_test[0]), int(bits_in_list_to_test[1]), int(bits_in_list_to_test[2]))
 
     if mod_dict:
         if aconf.json:
-            json_struct = {'dh-gex-modulus-size': mod_dict}
+            json_struct = {'dh-gex-modulus-size': mod_dict, 'dh-gex-evidence': GEXTest.evidence_struct()}
             out.info(json.dumps(json_struct, indent=4 if aconf.json_print_indent else None, sort_keys=True))
         else:
             out.head('# diffie-hellman group exchange modulus size')
@@ -1444,6 +1462,17 @@ def run_gex_granular_modulus_size_test(out: OutputBuffer, s: 'SSH_Socket', kex: 
             for key, value in mod_dict.items():
                 padding = (max_key_len - len(key)) + 1
                 out.info(key + " " * padding + '--> ' + ', '.join([str(i) for i in value]))
+
+    # Even when no modulus was observed (all probes refused or interrupted),
+    # surface the evidence so the lack of a conclusion is explicit rather
+    # than silently looking like a clean pass.
+    elif GEXTest.evidence:
+        if aconf.json:
+            json_struct = {'dh-gex-evidence': GEXTest.evidence_struct()}
+            out.info(json.dumps(json_struct, indent=4 if aconf.json_print_indent else None, sort_keys=True))
+        else:
+            out.head('# diffie-hellman group exchange modulus size')
+            GEXTest.write_text_summary(out)
 
     return program_retval
 

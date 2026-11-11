@@ -43,6 +43,10 @@ class SSH2_Kex:
         self.__unused = unused
 
         self.__dh_modulus_sizes: Dict[str, int] = {}
+        # GEX algorithms whose modulus size could not be established during
+        # the scan (every probe was refused or interrupted).  Policy checks
+        # treat an entry here as "evidence insufficient", never as a pass.
+        self.__gex_inconclusive: Dict[str, str] = {}
         self.__host_keys: Dict[str, Dict[str, Union[bytes, str, int]]] = {}
 
     @property
@@ -80,6 +84,15 @@ class SSH2_Kex:
 
     def dh_modulus_sizes(self) -> Dict[str, int]:
         return self.__dh_modulus_sizes
+
+    # Records that a GEX algorithm could not be fully tested, along with the
+    # reason.  This prevents a missing modulus size from being read as
+    # "only safe moduli are supported".
+    def set_gex_inconclusive(self, gex_alg: str, reason: str) -> None:
+        self.__gex_inconclusive[gex_alg] = reason
+
+    def gex_inconclusive(self) -> Dict[str, str]:
+        return self.__gex_inconclusive
 
     def set_host_key(self, key_type: str, raw_hostkey_bytes: bytes, hostkey_size: int, ca_key_type: str, ca_key_size: int) -> None:
 

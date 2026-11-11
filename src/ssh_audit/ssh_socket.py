@@ -60,6 +60,10 @@ class SSH_Socket(ReadBuf, WriteBuf):
         self.__state = 0
         self.__header: List[str] = []
         self.__banner: Optional[Banner] = None
+        # Latched the first time the peer closes the connection (recv()
+        # returns zero bytes).  While set, further reads report EOF instead
+        # of pulling data that belongs to a subsequent reconnect.
+        self.__eof = False
         if host is None:
             raise ValueError('undefined host')
         nport = Utils.parse_int(port)
@@ -323,6 +327,11 @@ class SSH_Socket(ReadBuf, WriteBuf):
     def recv(self, size: int = 2048) -> Tuple[int, Optional[str]]:
         if self.__sock is None:
             return -1, 'not connected'
+        # Once a connection has been closed by the peer, keep reporting EOF
+        # for the rest of its life so repeated reads cannot consume data that
+        # belongs to a later reconnect.
+        if self.__eof:
+            return -1, None
         try:
             data = self.__sock.recv(size)
         except socket.timeout:
@@ -332,6 +341,7 @@ class SSH_Socket(ReadBuf, WriteBuf):
                 return 0, 'retry'
             return -1, str(e.args[-1])
         if len(data) == 0:
+            self.__eof = True
             return -1, None
         pos = self._buf.tell()
         self._buf.seek(0, 2)
@@ -389,6 +399,12 @@ class SSH_Socket(ReadBuf, WriteBuf):
             payload_length = packet_length - padding_length - 1
             check_size = 4 + 1 + payload_length + padding_length
             if check_size % self.__block_size != 0:
+                # If the stream is already exhausted, this is a truncated
+                # packet caused by a connection close.  Report it through
+                # the normal (-1, ...) sentinel so callers can record the
+                # probe as incomplete instead of terminating the process.
+                if self.unread_len == 0:
+                    return -1, b'connection closed before a complete packet was received'
                 self.__outputbuffer.fail('[exception] invalid ssh packet (block size)').write()
                 sys.exit(exitcodes.CONNECTION_ERROR)
             self.ensure_read(payload_length)
@@ -430,6 +446,7 @@ class SSH_Socket(ReadBuf, WriteBuf):
         self.__state = 0
         self.__header = []
         self.__banner = None
+        self.__eof = False
 
 
     def _close_socket(self, s: Optional[socket.socket]) -> None:
